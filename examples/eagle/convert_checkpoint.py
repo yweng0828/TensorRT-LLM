@@ -295,8 +295,14 @@ if __name__ == '__main__':
         args.n_positions = hf_config.max_position_embeddings
         args.dtype = str(
             hf_config.torch_dtype)[6:] if args.dtype == 'auto' else args.dtype
-        args.head_dim = hf_config.head_dim
-        args.head_size = args.head_dim
+        if 'head_dim' in hf_config:
+            args.head_dim = hf_config['head_dim']
+        else:
+            args.head_dim = args.n_embd // args.n_head
+        if 'head_size' in hf_config:
+            args.head_size = hf_config['head_size']
+        else:
+            args.head_size = args.head_dim
 
         if args.eagle_model_dir is None:
             hf_config_eagle = hf_config.eagle
@@ -311,8 +317,10 @@ if __name__ == '__main__':
                 args.head_dim_eagle = hf_config_eagle['head_dim']
             else:
                 args.head_dim_eagle = args.n_embd_eagle // args.n_head_eagle
-
-            args.head_size_eagle = args.head_dim_eagle
+            if 'head_size' in hf_config_eagle:
+                args.head_size_eagle = hf_config_eagle['head_size']
+            else:
+                args.head_size_eagle = args.head_dim_eagle
         else:
             hf_config_eagle = LlamaConfig.from_pretrained(args.eagle_model_dir)
             args.n_head_eagle = hf_config_eagle.num_attention_heads
