@@ -488,7 +488,7 @@ class ModelDrafter(Drafter):
             # We already updated the target state, so the new_tokens_lens should be all ones.
             new_tokens_lens = torch.ones(batch_size, device=device)
             next_draft_tokens = torch.zeros(batch_size,
-                                            self.max_draft_tokens,
+                                            self.max_draft_len,
                                             device=device)
 
         # Create a new SampleStateTensorsMTP object with the additional fields
