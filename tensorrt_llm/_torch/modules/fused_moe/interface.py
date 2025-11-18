@@ -9,7 +9,8 @@ from torch import nn
 from ...distributed.ops import reducescatter
 from ...model_config import ModelConfig
 from ...utils import (ActivationType, AuxStreamType, Fp4QuantizedTensor,
-                      get_model_extra_attrs, is_torch_compiling)
+                      get_model_extra_attrs, is_gated_activation,
+                      is_torch_compiling)
 from .routing import BaseMoeRoutingMethod
 
 
@@ -163,6 +164,8 @@ class MoE(nn.Module):
         self.layer_idx = layer_idx
         self.layer_idx_str = str(layer_idx) if layer_idx is not None else None
         self.activation_type = int(activation_type)
+        self.is_gated_activation = is_gated_activation(activation_type)
+        self.intermediate_size_expand_ratio = 2 if self.is_gated_activation else 1
 
         self._register_layer(model_config)
 
