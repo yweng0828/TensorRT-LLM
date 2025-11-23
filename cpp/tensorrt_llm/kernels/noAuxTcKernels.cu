@@ -29,8 +29,10 @@ using namespace tensorrt_llm::common;
 namespace tensorrt_llm::kernels
 {
 static constexpr int WARP_SIZE = 32;
+static constexpr int NumNemotronExperts = 512;
 static constexpr int NumKimiK2Experts = 384;
 static constexpr int NumDeepseekExperts = 256;
+static constexpr int MaxSupportedExpertCount = std::max({NumNemotronExperts, NumKimiK2Experts, NumDeepseekExperts});
 static constexpr int MaxNumExpertsUnit = 128;
 static constexpr int NumTopGroupScores = 2;
 static constexpr int MaxNumTopExperts = 8;
@@ -41,7 +43,8 @@ static __device__ inline float sigmoid_accurate(float x)
     return 0.5f * tanhf(0.5f * x) + 0.5f;
 }
 
-template <typename InputT, typename BiasT, typename OutputT, typename IdxT, int MaxNumExperts, bool UseGroups>
+template <typename InputT, typename BiasT, typename OutputT, typename IdxT, int MaxNumExperts, bool UseGroups,
+    int RealNumTopExperts = MaxNumTopExperts>
 __global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, IdxT* topkIndices, BiasT* routingBias,
     int64_t const numTokens, int64_t const numGroup, int64_t const topkGroup, int64_t const topk,
     int64_t const numExperts, int64_t const numExpertsPerGroup, double const routedScalingFactor)
@@ -120,8 +123,8 @@ __global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, Idx
     int32_t topGroupIdx[MaxNumTopGroups];
     float expertScoreGroup[MaxNumTopGroups];
     int32_t expertIdxGroup[MaxNumTopGroups];
-    float topScores[MaxNumTopExperts]; // bound of topk
-    int32_t topExperts[MaxNumTopExperts];
+    float topScores[RealNumTopExperts]; // bound of topk
+    int32_t topExperts[RealNumTopExperts];
 
     if constexpr (UseGroups)
     {
@@ -129,7 +132,7 @@ __global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, Idx
             /* minValue */ invalidScoreFloat);
 
         // get the final group score and write it to shared
-        if (laneIdx == 0)
+        if (warp.thread_rank() == 0)
         {
             auto groupScore = topExpGroupScores[0] + topExpGroupScores[1];
             smemGroupScores[warpIdx] = groupScore;
@@ -148,9 +151,7 @@ __global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, Idx
 
             reduce_topk::reduceTopK(warp, topGroups, topGroupIdx, groupScore, laneIdx,
                 /* minValue */ invalidScoreFloat);
-
-            // final expert selection: get relevant indexes and scores from shared
-
+            //( final expert selection: get relevant indexes and scores from shared
 #pragma unroll
             for (int ii = 0; ii < MaxNumTopGroups; ++ii)
             { // bound of numGroup
@@ -158,12 +159,11 @@ __global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, Idx
                 expertIdxGroup[ii] = groupIdx * numExpertsPerGroup + laneIdx;
 
                 expertScoreGroup[ii]
-                    = groupIdx < numGroup && expertSelected ? smemScoreBias[expertIdxGroup[ii]] : invalidScoreFloat;
+                    = (ii < topkGroup) && expertSelected ? smemScoreBias[expertIdxGroup[ii]] : invalidScoreFloat;
             }
 
-            tensorrt_llm::kernels::reduce_topk::reduceTopK(warp, topScores, topExperts, expertScoreGroup,
-                expertIdxGroup,
-                /* minValue */ invalidScoreFloat, topk);
+            tensorrt_llm::kernels::reduce_topk::reduceTopK(
+                warp, topScores, topExperts, expertScoreGroup, expertIdxGroup, /* minValue */ invalidScoreFloat, topk);
         }
     }
     else if constexpr (MaxNumExperts > MaxNumExpertsUnit)
@@ -172,7 +172,7 @@ __global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, Idx
         // we need to use multiple warps to calculate the intermediate topk results
 
         int constexpr NumExpertWarps = (MaxNumExperts - 1) / MaxNumExpertsUnit + 1;
-        int constexpr NumInterTopK = NumExpertWarps * MaxNumTopExperts;
+        int constexpr NumInterTopK = NumExpertWarps * RealNumTopExperts;
         __shared__ float __attribute((aligned(128))) smemInterTopScores[NumInterTopK];
         __shared__ int32_t __attribute((aligned(128))) smemInterTopExperts[NumInterTopK];
         if (warpIdx < NumExpertWarps)
@@ -191,14 +191,19 @@ __global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, Idx
 
             if (laneIdx < topk)
             {
-                smemInterTopScores[warpIdx * MaxNumTopExperts + laneIdx] = topScores[laneIdx];
-                smemInterTopExperts[warpIdx * MaxNumTopExperts + laneIdx] = topExperts[laneIdx];
+                smemInterTopScores[warpIdx * RealNumTopExperts + laneIdx] = topScores[laneIdx];
+                smemInterTopExperts[warpIdx * RealNumTopExperts + laneIdx] = topExperts[laneIdx];
+            }
+            else if (laneIdx >= topk && laneIdx < RealNumTopExperts)
+            {
+                smemInterTopScores[warpIdx * RealNumTopExperts + laneIdx] = invalidScoreFloat;
+                smemInterTopExperts[warpIdx * RealNumTopExperts + laneIdx] = MaxNumExperts - 1;
             }
         }
         __syncthreads();
         if (warpIdx == 0)
         {
-            int constexpr NumInterTopKPerThread = (NumInterTopK * NumExpertWarps - 1) / WARP_SIZE + 1;
+            int constexpr NumInterTopKPerThread = (NumInterTopK - 1) / WARP_SIZE + 1;
             float intermidiateScore[NumInterTopKPerThread];
             int32_t intermidiateExpert[NumInterTopKPerThread];
             for (int i = laneIdx; i < NumInterTopKPerThread * WARP_SIZE; i += WARP_SIZE)
@@ -265,11 +270,11 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
 {
 
     // Check if we can use the optimized deepseek_v3_topk_kernel
-    bool const is_single_group = (n_group == 1) && (num_experts <= NumKimiK2Experts);
+    bool const is_single_group = (n_group <= 1) && (num_experts <= MaxSupportedExpertCount);
 
     int64_t const experts_per_group = num_experts / n_group;
-    bool const is_multi_group = (n_group != 1) && (num_experts <= NumDeepseekExperts)
-        && (experts_per_group <= WARP_SIZE) && (experts_per_group * topk_group <= MaxNumExpertsUnit);
+    bool const is_multi_group = (n_group > 1) && (num_experts <= NumDeepseekExperts) && (experts_per_group <= WARP_SIZE)
+        && (experts_per_group * topk_group <= MaxNumExpertsUnit);
 
     if (is_single_group || is_multi_group)
     {
@@ -278,7 +283,19 @@ void invokeNoAuxTc(InputT* scores, BiasT* bias, OutputT* topk_values, IdxT* topk
         int num_threads = NumDeepseekExperts;
         if (is_single_group)
         {
-            if (num_experts > MaxNumExpertsUnit)
+            // Special case for Nemotron, which selects 22 from 512 experts, and 1 group only.
+            if (num_experts == NumNemotronExperts && n_group == 1 && topk == 22)
+            {
+                kernel_instance = &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, NumNemotronExperts, false, 22>;
+                num_threads = NumNemotronExperts;
+            }
+            else if (num_experts > NumKimiK2Experts && num_experts <= MaxSupportedExpertCount)
+            {
+                kernel_instance
+                    = &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, MaxSupportedExpertCount, false>;
+                num_threads = MaxSupportedExpertCount;
+            }
+            else if (num_experts > MaxNumExpertsUnit && num_experts <= NumKimiK2Experts)
             {
                 kernel_instance = &deepseek_v3_topk_kernel<InputT, BiasT, OutputT, IdxT, NumKimiK2Experts, false>;
                 num_threads = NumKimiK2Experts;
